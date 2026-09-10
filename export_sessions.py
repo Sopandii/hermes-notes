@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 Daily session export + push to GitHub.
-Exports new Hermes sessions to markdown, commits, and pushes to repo.
+Exports new Hermes sessions to markdown, sorts into sessions/YYYY-MM/ folders,
+commits, and pushes to repo.
 """
 import os
 import sys
@@ -62,13 +63,17 @@ def _scrub_pat_tokens(filepath):
     except Exception as e:
         print(f"    Warning: failed to scrub {filepath}: {e}", file=sys.stderr)
 
+def _get_month_folder(session_id):
+    """Derive YYYY-MM folder from session ID (format: YYYYMMDD_HHMMSS_hash)."""
+    m = re.match(r'(\d{4})(\d{2})\d{2}_\d{6}_', session_id)
+    if m:
+        year, month = m.group(1), m.group(2)
+        return SESSIONS_DIR / f"{year}-{month}"
+    return SESSIONS_DIR  # fallback
+
 def export_session(session_id):
-    """Export a single session to markdown via hermes CLI."""
+    """Export a single session to markdown via hermes CLI, sorted into month folder."""
     print(f"Exporting session {session_id}...")
-    
-    # Build safe filename from session ID
-    safe_name = session_id.replace("/", "_").replace(" ", "-")
-    out_path = SESSIONS_DIR / f"{safe_name}.md"
     
     # Run hermes sessions export
     stdout, stderr, rc = run(
@@ -80,21 +85,32 @@ def export_session(session_id):
         print(f"Export failed for {session_id}: {stderr}", file=sys.stderr)
         return None
     
-    # The export command prints the output path. Parse it.
-    # Expected format: "Exported 1 session (N messages) to /path/to/file.md"
+    # Parse exported path from stdout
     match = re.search(r'to\s+(/\S+\.md)', stdout)
-    if match:
-        src_path = Path(match.group(1))
-        if src_path.exists():
-            # Copy to our sessions dir with consistent naming
-            shutil.copy2(src_path, out_path)
-            print(f"  -> {out_path}")
-            # Scrub GitHub PATs from the exported content before committing
-            _scrub_pat_tokens(out_path)
-            return str(out_path)
+    if not match:
+        print(f"  Could not determine export path from: {stdout[:200]}", file=sys.stderr)
+        return None
     
-    print(f"  Could not determine export path from: {stdout[:200]}", file=sys.stderr)
-    return None
+    src_path = Path(match.group(1))
+    if not src_path.exists():
+        print(f"  Exported file not found: {src_path}", file=sys.stderr)
+        return None
+    
+    # Determine target folder (YYYY-MM)
+    month_folder = _get_month_folder(session_id)
+    month_folder.mkdir(parents=True, exist_ok=True)
+    
+    # Build safe filename
+    safe_name = session_id.replace("/", "_").replace(" ", "-")
+    out_path = month_folder / f"{safe_name}.md"
+    
+    # Copy to sessions/YYYY-MM/ folder
+    shutil.copy2(src_path, out_path)
+    print(f"  -> {out_path} (in {month_folder.name}/)")
+    
+    # Scrub GitHub PATs from the exported content before committing
+    _scrub_pat_tokens(out_path)
+    return str(out_path)
 
 def commit_and_push():
     """Git add, commit, push new files."""
@@ -104,7 +120,7 @@ def commit_and_push():
     run(f"git config user.email 'cron@hermes-notes.local'", cwd=REPO_DIR)
     run(f"git config user.name 'Hermes Session Exporter'", cwd=REPO_DIR)
     
-    # Add new/changed files
+    # Add new/changed files (sessions/ + skills/)
     stdout, _, rc = run("git add sessions/ skills/", cwd=REPO_DIR, check=False)
     
     # Check if there's anything to commit
@@ -129,7 +145,7 @@ def commit_and_push():
 def main():
     print(f"=== Session Export Cron ({datetime.now(timezone.utc).isoformat()}) ===")
     
-    # Ensure directories exist
+    # Ensure sessions dir exists
     SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
     
     # Load already-exported session IDs
@@ -141,7 +157,7 @@ def main():
         import sqlite3
         conn = sqlite3.connect(HERMES_SESSIONS_DB)
         cursor = conn.execute(
-            "SELECT id FROM sessions ORDER BY created_at DESC"
+            "SELECT id FROM sessions ORDER BY started_at DESC"
         )
         all_session_ids = [row[0] for row in cursor.fetchall()]
         conn.close()
@@ -150,10 +166,9 @@ def main():
         print(f"Failed to query sessions DB: {e}", file=sys.stderr)
         # Fallback: use hermes CLI to list sessions
         stdout, _, _ = run("hermes sessions list --limit 100")
-        # Parse session IDs from the table output (they're in the last column)
+        # Parse session IDs from the table output (last column)
         session_ids = []
         for line in stdout.split('\n'):
-            # Session ID looks like: 20260908_152707_24a829
             match = re.search(r'\b(\d{8}_\d{6}_\w{6})\b', line)
             if match:
                 session_ids.append(match.group(1))
